@@ -3,6 +3,12 @@
 Short, runnable examples for [Solari](https://getsolari.com) — cloud browsers,
 sandboxes, and desktops behind one API key.
 
+> **This fork adds [vpi-solari](examples/vpi-solari)**: a production collector
+> from the [Venezuela Price Index](https://vpindex.org) that reads a retailer
+> behind a site-wide Cloudflare challenge from a Solari stealth browser. The
+> source needed a visible Chrome window on a laptop; now it runs in the cloud
+> with a replay per run. Start at [examples/vpi-solari/README.md](examples/vpi-solari/README.md).
+
 Every example in this repo is a complete program you can run in under a minute.
 They are deliberately small: one idea each, no framework, no scaffolding to read
 past. Copy one into your project and change the parts you care about.
@@ -18,6 +24,7 @@ past. Copy one into your project and change the parts you care about.
 | [browser-stealth-proxy-ts](examples/browser-stealth-proxy-ts) | TypeScript | Stealth mode + residential proxy egress |
 | [browser-profiles-ts](examples/browser-profiles-ts) | TypeScript | Log in once, reuse the session forever |
 | [browser-session-recording-py](examples/browser-session-recording-py) | Python | Record a session, download the replay |
+| [vpi-solari](examples/vpi-solari) | Python | Production price collector behind a Cloudflare challenge: stealth + captcha + sticky proxy + profile + replay |
 
 ### Sandbox
 
