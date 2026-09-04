@@ -22,31 +22,42 @@ no display, no laptop, one replay per run. First live run: challenge cleared in
 ## What it does
 
 ```
-python main.py discover harina --n 5          # seed: search the store, list product ids
-python main.py panel panel.json --out rows.json   # daily: re-fetch a fixed panel
+python main.py crawl --out rows.json            # daily: every department, every tile, every price
+python main.py discover harina --n 5            # search the store, list product ids
+python main.py panel panel.json --out rows.json # spot check: one product page per id
 ```
 
-Both print a run receipt: session id, egress country, page count, how many
-pages hit a challenge, latency, and a replay URL when `--record` is set.
-Prices go to `--out`, never to stdout, unless you pass `--show-prices`.
-The index sells the data and publishes the code.
+The daily job is the crawl. A product page is one price per load; a listing
+page is fifteen, and the store's page size is locked at fifteen no matter what
+`product_list_limit` asks for. So the collector walks each department's
+listing pages with `?p=N`, reads the toolbar's "1 - 15 de 106" to know when a
+department is done, and reads every tile. Nine departments, about 2,800 SKUs
+by the nav counts, under 200 page loads, roughly ten minutes of browser time.
+That is the whole store every day, not a sample of it.
+
+All three commands print a run receipt: session id, page count, how many
+pages hit a challenge, how many Turnstile clicks were issued, latency, and a
+replay URL when `--record` is set. Prices go to `--out`, never to stdout,
+unless you pass `--show-prices`. The index sells the data and publishes the code.
 
 ```
-python main.py --record --profile vpi-plazas panel panel.json --out rows.json
+python main.py --record --profile vpi-plazas crawl --out rows.json
 ```
 
 `--profile` stores the session's cookies in a Solari profile at the end of the
-run and attaches them next time, so the challenge is paid once, not daily.
-This is the cloud version of the persistent Chrome profile the laptop used.
+run and attaches them next time. In practice a new session is challenged again
+regardless, so this costs nothing and saves nothing today; it is left in for
+when clearance survives the session.
 
 ## How it is put together
 
 | File | Role |
 | --- | --- |
-| `plazas_parser.py` | Pure functions over HTML: search grid to candidates, product page to a price row, challenge detection. No network. |
+| `plazas_parser.py` | Pure functions over HTML: product tiles to candidates, product page to a price row, challenge detection. No network. |
+| `listing.py` | The catalog walk: department links from the nav, `?p=N` pagination, toolbar totals, dedup across departments. Takes any object with `fetch(url)`. |
 | `solari_fetch.py` | One stealth session per run (`stealth`, `captcha`, optional `recording`, `profile_id`, `proxy`). `fetch(url)` waits for the challenge to clear, clicking the Turnstile checkbox in Cloudflare's iframe when it renders, and returns the document plus a status record. |
-| `main.py` | The two commands and the receipt. |
-| `test_parser.py` | Offline fixtures for the parser. `python test_parser.py` |
+| `main.py` | The three commands and the receipt. |
+| `test_parser.py` | Offline fixtures for both parsers. `python test_parser.py` |
 
 What actually clears the challenge, verified live on 2026-09-04:
 
@@ -87,8 +98,11 @@ python main.py discover harina --n 5
 
 - The store branch is pinned by subdomain, so the site does not need a
   Venezuelan IP to serve prices (and Venezuela is not a Solari proxy country).
-- One product per page load; there is no batch endpoint. A 60-item panel is
-  about 60 page loads at 2-second spacing, a few minutes of stealth time.
+- Listing pages carry 15 tiles each and the store ignores `product_list_limit`.
+  The nav's per-department counts run low; the listing toolbar's total is
+  the number to trust.
+- Tiles do not render a stock badge, so stock is unknown from the crawl.
+  The product page does render it, which is what `panel` is for.
 - `FetchResult.ok` is false for anything that is not a clean document: a
   challenge that never cleared, a 404, a timeout. The caller counts those as
   missing for the day and measures dropout; a missing price is never filled in.

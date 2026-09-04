@@ -14,9 +14,14 @@ Two commands:
       Search the store for a term and print the product identities found.
       This is how a panel is seeded.
 
+  python main.py crawl --out rows.json
+      Walk every department's listing pages and write every product tile
+      seen (id, sku, name, price). Fifteen prices per page load instead of
+      one, so the whole store is a few hundred loads. This is the daily job.
+
   python main.py panel panel.json --out rows.json
-      Re-fetch a fixed panel of product ids and write today's rows to a file.
-      This is the daily job.
+      Re-fetch a fixed panel of product ids, one product page each. The
+      expensive path; kept for spot checks.
 
 Both print a run receipt (counts, latency, session id, replay URL when
 `--record` is set). Prices are written to `--out`, never printed, unless you
@@ -42,6 +47,7 @@ from plazas_parser import (
     product_url,
     search_url,
 )
+from listing import crawl, estimate_loads, parse_categories
 from solari_fetch import SolariFetcher, ensure_profile
 
 MAX_SEARCH_PAGES = 3
@@ -102,9 +108,14 @@ async def run(args: argparse.Namespace) -> int:
         save_profile=bool(profile_id),
         spacing_sec=args.spacing,
     ) as fetcher:
+        crawl_stats = None
         if args.command == "discover":
             results = await discover(fetcher, args.term, args.n, args.branch)
             kind = "candidates"
+        elif args.command == "crawl":
+            found, crawl_stats = await crawl(fetcher, log=lambda m: print(m, file=sys.stderr))
+            results = list(found.values())
+            kind = "tiles"
         else:
             panel = json.loads(Path(args.panel).read_text())
             items = panel["items"] if isinstance(panel, dict) else panel
@@ -122,6 +133,8 @@ async def run(args: argparse.Namespace) -> int:
         kind: len(results),
         "wall_ms": int((time.monotonic() - t0) * 1000),
     }
+    if crawl_stats is not None:
+        summary["crawl"] = crawl_stats.as_dict()
     print(_receipt_line(receipt.as_dict(), summary))
 
     if args.show_prices or (args.command == "discover" and not args.out):
@@ -145,7 +158,8 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("discover", help="search the store and list product identities")
     d.add_argument("term")
     d.add_argument("--n", type=int, default=5)
-    f = sub.add_parser("panel", help="re-fetch a fixed panel of product ids")
+    sub.add_parser("crawl", help="walk every department listing; every tile with its price")
+    f = sub.add_parser("panel", help="re-fetch a fixed panel of product ids, one page each")
     f.add_argument("panel", help="JSON: a list of {source_id} or {items: [...]}")
     return p
 

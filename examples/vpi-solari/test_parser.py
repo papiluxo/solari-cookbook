@@ -112,3 +112,31 @@ if __name__ == "__main__":
             fn()
             print("ok ", name)
     print("all parser tests passed")
+
+
+# ---- listing pages (fabricated markup, same shapes as the live store) ----
+from listing import Category, listing_url, parse_categories, parse_toolbar  # noqa: E402
+
+HOME_NAV_HTML = """
+<nav class="navigation"><ul>
+  <li class="level0"><a href="https://vallearriba.elplazas.com/depto-uno.html"><span>DEPTO UNO (113)</span></a>
+    <ul><li class="level1"><a href="https://vallearriba.elplazas.com/depto-uno/sub.html">SUB</a></li></ul></li>
+  <li class="level0"><a href="https://vallearriba.elplazas.com/depto-dos.html"><span>DEPTO DOS</span></a></li>
+  <li class="level0"><a href="https://vallearriba.elplazas.com/depto-uno.html"><span>DEPTO UNO (113)</span></a></li>
+</ul></nav>
+"""
+
+
+def test_categories_and_toolbar() -> None:
+    cats = parse_categories(HOME_NAV_HTML)
+    assert [(c.name, c.nav_count) for c in cats] == [("DEPTO UNO", 113), ("DEPTO DOS", None)], cats
+    assert listing_url(cats[0].url, 1) == cats[0].url
+    assert listing_url(cats[0].url, 3).endswith("depto-uno.html?p=3")
+    assert parse_toolbar('<p class="toolbar-amount"><span>Artículos</span> 16 - 30 <span>de</span> 106</p>') == (16, 30, 106)
+    assert parse_toolbar('<p class="toolbar-amount">7 Artículos</p>') == (1, 7, 7)
+    assert parse_toolbar("<p></p>") == (None, None, None)
+
+
+if __name__ == "__main__":
+    test_categories_and_toolbar()
+    print("ok  test_categories_and_toolbar")
