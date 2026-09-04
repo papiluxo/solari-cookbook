@@ -38,6 +38,21 @@ CHALLENGE_WAIT_SEC = 75
 CHALLENGE_POLL_SEC = 1.5
 CLICK_AFTER_SEC = 6      # let the widget render before the first click
 CLICK_RETRY_SEC = 12     # click again if the interstitial is still there
+EXPIRY_MARGIN_SEC = 45   # relaunch before the session's expires_at, not after
+
+
+def _parse_iso(ts: str) -> Optional[float]:
+    """ISO-8601 UTC ('...Z') -> epoch seconds, or None."""
+    try:
+        from datetime import datetime, timezone
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _browser_gone(e: Exception) -> bool:
+    msg = f"{type(e).__name__}: {e}"
+    return any(k in msg for k in ("TargetClosedError", "Browser closed", "has been closed", "Target closed", "frame was detached", "ERR_ABORTED"))
 
 
 def _looks_like_challenge(html: str, title: str) -> bool:
@@ -69,8 +84,11 @@ class RunReceipt:
     ok: int = 0
     challenged: int = 0
     clicks: int = 0  # Turnstile checkbox clicks issued
+    relaunches: int = 0  # sessions opened after the first one died or neared expiry
+    session_ids: list[str] = field(default_factory=list)
     total_ms: int = 0
     replay_url: str = ""
+    replay_urls: list[str] = field(default_factory=list)
     profile_id: str = ""
     errors: list[str] = field(default_factory=list)
 
@@ -105,9 +123,10 @@ class SolariFetcher:
         self._browser: Any = None
         self._page: Any = None
         self._last_fetch_at = 0.0
+        self._expires_at: Optional[float] = None
         self.receipt: Optional[RunReceipt] = None
 
-    async def __aenter__(self) -> "SolariFetcher":
+    async def _launch(self) -> None:
         self._browser = await self._solari.launch(
             stealth=True,
             captcha=True,
@@ -116,15 +135,47 @@ class SolariFetcher:
             profile_id=self._profile_id,
             retries=1,
         )
-        self.receipt = RunReceipt(
-            session_id=self._browser.id,
-            started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            proxy_country=(self._browser.proxy.country if self._browser.proxy else ""),
-            proxy_tier=(self._browser.proxy.tier or "") if self._browser.proxy else "",
-            profile_id=self._profile_id or "",
-        )
         self._page = await self._browser.new_page()
+        self._expires_at = _parse_iso(self._browser.expires_at)
+        if self.receipt is not None:
+            self.receipt.session_ids.append(self._browser.id)
+
+    async def __aenter__(self) -> "SolariFetcher":
+        self.receipt = RunReceipt(session_id="", started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), profile_id=self._profile_id or "")
+        await self._launch()
+        self.receipt.session_id = self._browser.id
+        self.receipt.proxy_country = self._browser.proxy.country if self._browser.proxy else ""
+        self.receipt.proxy_tier = (self._browser.proxy.tier or "") if self._browser.proxy else ""
         return self
+
+    async def _release(self, collect_replay: bool) -> None:
+        """Close the current browser; optionally fetch its replay URL."""
+        if self._browser is None:
+            return
+        sid = self._browser.id
+        try:
+            await self._browser.close()
+        except Exception:  # noqa: BLE001 - already dead is fine
+            pass
+        self._browser = None
+        self._page = None
+        if collect_replay and self._recording and self.receipt is not None:
+            url = await self._replay_url(sid)
+            if url:
+                self.receipt.replay_urls.append(url)
+
+    async def _relaunch(self, why: str) -> None:
+        """Sessions have a lifetime (`expires_at`). A crawl longer than that
+        must carry on in a fresh session: same run, same receipt, one more
+        challenge to click through."""
+        assert self.receipt is not None
+        self.receipt.relaunches += 1
+        self.receipt.errors.append(f"relaunch #{self.receipt.relaunches}: {why}"[:200])
+        await self._release(collect_replay=True)
+        await self._launch()
+
+    def _near_expiry(self) -> bool:
+        return self._expires_at is not None and (self._expires_at - time.time()) < EXPIRY_MARGIN_SEC
 
     async def __aexit__(self, *_exc: Any) -> None:
         await self.finish()
@@ -134,17 +185,25 @@ class SolariFetcher:
         return self._browser.id if self._browser else ""
 
     async def fetch(self, url: str) -> FetchResult:
-        assert self._page is not None and self.receipt is not None
+        assert self.receipt is not None
         # Polite spacing between page loads, measured from the previous fetch.
         wait = self._spacing - (time.monotonic() - self._last_fetch_at)
         if wait > 0:
             await asyncio.sleep(wait)
+        if self._near_expiry():
+            await self._relaunch("session near expiry")
         t0 = time.monotonic()
         status: Optional[int] = None
         challenged = False
         html = ""
         try:
-            resp = await self._page.goto(url, wait_until="domcontentloaded", timeout=self._goto_timeout)
+            try:
+                resp = await self._page.goto(url, wait_until="domcontentloaded", timeout=self._goto_timeout)
+            except Exception as e:  # noqa: BLE001
+                if not _browser_gone(e):
+                    raise
+                await self._relaunch(f"{type(e).__name__}: {e}".splitlines()[0][:120])
+                resp = await self._page.goto(url, wait_until="domcontentloaded", timeout=self._goto_timeout)
             status = resp.status if resp is not None else None
             html, title = await self._read_document()
             # Solari solves the challenge in-page; the document swaps itself
@@ -204,25 +263,19 @@ class SolariFetcher:
         return "", ""  # unreachable
 
     async def finish(self) -> RunReceipt:
-        """Save the profile if asked, release the session, collect the replay URL."""
+        """Save the profile if asked, release the session, collect the replay URL(s)."""
         assert self.receipt is not None
         if self._browser is None:
             return self.receipt
-        session_id = self._browser.id
         try:
-            if self._save_profile and self._profile_id:
-                ctx = self._browser.contexts()[0]
-                state = await ctx.storage_state()
+            if self._save_profile and self._profile_id and self._browser.contexts():
+                state = await self._browser.contexts()[0].storage_state()
                 await self._solari.profiles.save(self._profile_id, state)
         except Exception as e:  # noqa: BLE001
             self.receipt.errors.append(f"profile save: {type(e).__name__}: {e}"[:300])
-        try:
-            await self._browser.close()
-        finally:
-            self._browser = None
-            self._page = None
-        if self._recording:
-            self.receipt.replay_url = await self._replay_url(session_id)
+        await self._release(collect_replay=True)
+        if self.receipt.replay_urls:
+            self.receipt.replay_url = self.receipt.replay_urls[-1]
         await self._solari.close()
         self.receipt.finished_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         return self.receipt
