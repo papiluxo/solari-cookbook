@@ -134,7 +134,7 @@ async def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--proxy", default=os.environ.get("SOLARI_PROXY_COUNTRY", "us"), help="residential egress country (default us)")
+    p.add_argument("--proxy", default=os.environ.get("SOLARI_PROXY_COUNTRY", ""), help="residential egress country; off by default (not needed for this site, see README)")
     p.add_argument("--branch", default=DEFAULT_BRANCH, help="store branch subdomain to pin")
     p.add_argument("--record", action="store_true", help="record the session and print a replay URL")
     p.add_argument("--profile", default="", help="Solari profile name to carry clearance cookies across runs")

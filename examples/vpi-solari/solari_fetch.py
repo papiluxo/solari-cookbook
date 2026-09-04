@@ -1,13 +1,20 @@
 """A Solari-backed page fetcher for sites behind a bot-defense challenge.
 
-One stealth session per run, reused for every page in that run. The session is
-created with the three knobs that matter for a Cloudflare-gated storefront:
+One stealth session per run, reused for every page in that run. What was
+verified live against a Cloudflare Managed Challenge (2026-09-04):
 
-  stealth=True   a real headful Chrome on real hardware, so the TLS/JA3
-                 fingerprint is a browser's, not a Python client's
-  captcha=True   Solari clears Turnstile / managed challenges for us
-  proxy=...      sticky residential egress, so the clearance cookie the site
-                 hands out keeps matching the IP that earned it
+  stealth=True   a real headful Chrome on real hardware. Required: the
+                 default browser is served the interstitial forever.
+  captcha=True   Solari's managed solving. Left on, but on its own it did
+                 not clear this site's Turnstile within 45 s in any run.
+  the click      what actually clears it: after the interstitial renders,
+                 click the Turnstile checkbox inside Cloudflare's iframe
+                 (`challenges.cloudflare.com`). Cleared in ~15 s every time.
+  proxy=None     the default. On the Starter plan, residential/mobile
+                 egress either failed at the tunnel (ERR_TUNNEL_CONNECTION_
+                 FAILED) or reported the same datacenter IP as no proxy,
+                 and the challenge cleared without one. `proxy_country` is
+                 still accepted for plans where egress works.
 
 Optionally the run is recorded (`recording=True`) so a replay URL comes back
 with the receipt, and a Solari profile can carry the clearance cookies from
@@ -27,8 +34,10 @@ from typing import Any, Optional
 from solari_browser import ProxyRequest, Solari
 from solari_browser.errors import SolariError
 
-CHALLENGE_WAIT_SEC = 45
+CHALLENGE_WAIT_SEC = 75
 CHALLENGE_POLL_SEC = 1.5
+CLICK_AFTER_SEC = 6      # let the widget render before the first click
+CLICK_RETRY_SEC = 12     # click again if the interstitial is still there
 
 
 def _looks_like_challenge(html: str, title: str) -> bool:
@@ -59,6 +68,7 @@ class RunReceipt:
     fetches: int = 0
     ok: int = 0
     challenged: int = 0
+    clicks: int = 0  # Turnstile checkbox clicks issued
     total_ms: int = 0
     replay_url: str = ""
     profile_id: str = ""
@@ -75,8 +85,8 @@ class SolariFetcher:
         self,
         api_key: str,
         *,
-        proxy_country: str = "us",
-        sticky_label: str = "vpi-plazas",
+        proxy_country: str = "",
+        sticky_label: str = "",
         recording: bool = False,
         profile_id: Optional[str] = None,
         save_profile: bool = False,
@@ -84,7 +94,9 @@ class SolariFetcher:
         goto_timeout_ms: int = 30_000,
     ) -> None:
         self._solari = Solari(api_key=api_key)
-        self._proxy = ProxyRequest(country=proxy_country, session=sticky_label, session_duration=30)
+        self._proxy = (
+            ProxyRequest(country=proxy_country, session=sticky_label or None) if proxy_country else None
+        )
         self._recording = recording
         self._profile_id = profile_id
         self._save_profile = save_profile
@@ -138,8 +150,12 @@ class SolariFetcher:
             # Solari solves the challenge in-page; the document swaps itself
             # for the real one when it is done. Poll until that happens.
             deadline = time.monotonic() + CHALLENGE_WAIT_SEC
+            next_click = time.monotonic() + CLICK_AFTER_SEC
             while _looks_like_challenge(html, title) and time.monotonic() < deadline:
                 challenged = True
+                if time.monotonic() >= next_click:
+                    await self._click_turnstile()
+                    next_click = time.monotonic() + CLICK_RETRY_SEC
                 await asyncio.sleep(CHALLENGE_POLL_SEC)
                 html, title = await self._read_document()
             if challenged and not _looks_like_challenge(html, title):
@@ -156,6 +172,24 @@ class SolariFetcher:
         self.receipt.challenged += int(challenged)
         self.receipt.total_ms += elapsed
         return FetchResult(url=url, status=status, html=html, elapsed_ms=elapsed, challenged=challenged, ok=ok)
+
+    async def _click_turnstile(self) -> None:
+        """Click the checkbox in Cloudflare's Turnstile iframe, if present.
+        The widget lives in a cross-origin frame; clicking its bounding box
+        through the top-level mouse is what a person does, and what cleared
+        the managed challenge in every live run."""
+        assert self.receipt is not None
+        try:
+            for frame in self._page.frames:
+                if "challenges.cloudflare.com" in (frame.url or ""):
+                    el = await frame.frame_element()
+                    box = await el.bounding_box()
+                    if box:
+                        await self._page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                        self.receipt.clicks += 1
+                        return
+        except Exception as e:  # noqa: BLE001 - the frame can vanish mid-click when it clears
+            self.receipt.errors.append(f"turnstile click: {type(e).__name__}: {e}"[:200])
 
     async def _read_document(self) -> tuple[str, str]:
         """Read html + title, tolerating the challenge page replacing itself
